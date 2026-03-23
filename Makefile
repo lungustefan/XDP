@@ -1,8 +1,9 @@
 CLANG ?= clang
 CC ?= gcc
 ARCH := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
+MULTIARCH_INC := /usr/include/$(shell uname -m)-linux-gnu
 CFLAGS ?= -O2 -g -Wall -Wextra
-BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH)
+BPF_CFLAGS := -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) -I$(MULTIARCH_INC)
 INCLUDES := -Isrc
 LIBS := -lbpf -lelf -lz
 

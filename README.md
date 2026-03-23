@@ -71,6 +71,18 @@ Load with a rules file:
 sudo ./xdp_ddos load eth0 configs/rules.conf
 ```
 
+Load in shared mode on multiple interfaces (single shared map set):
+
+```bash
+sudo ./xdp_ddos load-many configs/rules.conf eth0 enp6s20 enp6s21
+```
+
+Detach then reattach on multiple interfaces (for rolling hardening updates):
+
+```bash
+sudo ./xdp_ddos reload-many configs/rules.conf eth0 enp6s20 enp6s21
+```
+
 `configs/rules.conf` is intentionally defaults-only. Manage IP/subnet/port overrides dynamically via API.
 
 Show one-shot stats:
@@ -85,6 +97,12 @@ Monitor stats continuously:
 sudo ./xdp_ddos monitor 2
 ```
 
+Live human-readable active monitor (shows block deltas and top sources):
+
+```bash
+sudo ./xdp_ddos active 2 15
+```
+
 Stream detection events to JSONL:
 
 ```bash
@@ -95,6 +113,12 @@ Unload:
 
 ```bash
 sudo ./xdp_ddos unload eth0
+```
+
+Unload from multiple interfaces:
+
+```bash
+sudo ./xdp_ddos unload-many eth0 enp6s20 enp6s21
 ```
 
 ## CLI Examples

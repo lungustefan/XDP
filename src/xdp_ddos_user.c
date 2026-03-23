@@ -2,12 +2,14 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <dirent.h>
 #include <linux/if_link.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <net/if.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +28,13 @@
 static volatile bool keep_running = true;
 static bool g_json_output = false;
 
+static int libbpf_logger(enum libbpf_print_level level, const char *fmt, va_list args)
+{
+    if (level == LIBBPF_DEBUG)
+        return 0;
+    return vfprintf(stderr, fmt, args);
+}
+
 static void on_sigint(int signo)
 {
     (void)signo;
@@ -38,9 +47,13 @@ static void usage(const char *prog)
         "Usage:\n"
         "  %s [--json] <command> ...\n"
         "  %s load <iface> [rules.conf]\n"
+        "  %s load-many <rules.conf|-> <iface1> [iface2 ...]\n"
         "  %s unload <iface>\n"
+        "  %s unload-many <iface1> [iface2 ...]\n"
+        "  %s reload-many <rules.conf|-> <iface1> [iface2 ...]\n"
         "  %s stats\n"
         "  %s monitor [interval_sec]\n"
+        "  %s active [interval_sec] [top_n]\n"
         "  %s log <output.jsonl> [poll_ms]\n"
         "  %s state top [n]\n"
         "  %s defaults show\n"
@@ -55,7 +68,7 @@ static void usage(const char *prog)
         "  %s port del <proto(tcp|udp)> <port>\n"
         "  %s port list\n",
         prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog,
-        prog, prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 static int parse_action(const char *s)
@@ -118,6 +131,46 @@ static int open_pinned_map(const char *name)
 
     snprintf(path, sizeof(path), "%s/%s", PIN_BASE, name);
     return bpf_obj_get(path);
+}
+
+static __u64 monotonic_ns(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+        return 0;
+
+    return (__u64)ts.tv_sec * 1000000000ULL + (__u64)ts.tv_nsec;
+}
+
+static int clear_pinned_objects(void)
+{
+    DIR *dir;
+    struct dirent *de;
+    char path[512];
+
+    dir = opendir(PIN_BASE);
+    if (!dir) {
+        if (errno == ENOENT)
+            return 0;
+        fprintf(stderr, "failed opening %s: %s\n", PIN_BASE, strerror(errno));
+        return -1;
+    }
+
+    while ((de = readdir(dir)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+
+        snprintf(path, sizeof(path), "%s/%s", PIN_BASE, de->d_name);
+        if (unlink(path) < 0 && errno != ENOENT) {
+            fprintf(stderr, "failed removing %s: %s\n", path, strerror(errno));
+            closedir(dir);
+            return -1;
+        }
+    }
+
+    closedir(dir);
+    return 0;
 }
 
 static int parse_ip_any(const char *s, struct ip_key *key)
@@ -413,6 +466,63 @@ struct top_state {
     struct ip_state state;
 };
 
+static int collect_stats_totals(__u64 total[STAT_MAX])
+{
+    int fd = open_pinned_map("stats");
+    int ncpu = libbpf_num_possible_cpus();
+    __u64 values[STAT_MAX][256];
+    __u32 key;
+    int cpu;
+
+    memset(total, 0, sizeof(__u64) * STAT_MAX);
+
+    if (ncpu <= 0 || ncpu > 256) {
+        fprintf(stderr, "unexpected cpu count: %d\n", ncpu);
+        return -1;
+    }
+
+    if (fd < 0) {
+        fprintf(stderr, "failed to open stats: %s\n", strerror(errno));
+        return -1;
+    }
+
+    for (key = 0; key < STAT_MAX; key++) {
+        if (bpf_map_lookup_elem(fd, &key, values[key]) < 0)
+            continue;
+        for (cpu = 0; cpu < ncpu; cpu++)
+            total[key] += values[key][cpu];
+    }
+
+    close(fd);
+    return 0;
+}
+
+static int count_active_blocks(void)
+{
+    int fd = open_pinned_map("ip_states");
+    struct ip_key key;
+    struct ip_key next;
+    struct ip_state st;
+    __u64 now_ns = monotonic_ns();
+    int blocked = 0;
+
+    if (fd < 0)
+        return -1;
+
+    if (bpf_map_get_next_key(fd, NULL, &next) == 0) {
+        do {
+            if (bpf_map_lookup_elem(fd, &next, &st) == 0) {
+                if (st.drop_until_ns > now_ns)
+                    blocked++;
+            }
+            key = next;
+        } while (bpf_map_get_next_key(fd, &key, &next) == 0);
+    }
+
+    close(fd);
+    return blocked;
+}
+
 static void maybe_insert_top(struct top_state *top, int *used, int cap,
                  const struct ip_key *key,
                  const struct ip_state *state)
@@ -455,6 +565,7 @@ static int print_top_states(int n)
     int used = 0;
     int i;
     char ipbuf[INET6_ADDRSTRLEN];
+    __u64 now_ns = monotonic_ns();
 
     if (n <= 0)
         n = 20;
@@ -485,7 +596,7 @@ static int print_top_states(int n)
         bool blocked;
 
         ip_key_to_str(&top[i].key, ipbuf, sizeof(ipbuf));
-        blocked = top[i].state.drop_until_ns > (__u64)time(NULL) * 1000000000ULL;
+        blocked = top[i].state.drop_until_ns > now_ns;
         if (g_json_output) {
             if (i)
                 printf(",");
@@ -709,32 +820,10 @@ static int list_ports(void)
 
 static int print_stats_once(void)
 {
-    int fd = open_pinned_map("stats");
-    int ncpu = libbpf_num_possible_cpus();
-    __u64 values[STAT_MAX][256];
     __u64 total[STAT_MAX] = {};
-    __u32 key;
-    int cpu;
 
-    if (ncpu <= 0 || ncpu > 256) {
-        fprintf(stderr, "unexpected cpu count: %d\n", ncpu);
+    if (collect_stats_totals(total) < 0)
         return -1;
-    }
-
-    if (fd < 0) {
-        fprintf(stderr, "failed to open stats: %s\n", strerror(errno));
-        return -1;
-    }
-
-    for (key = 0; key < STAT_MAX; key++) {
-        if (bpf_map_lookup_elem(fd, &key, values[key]) < 0)
-            continue;
-
-        for (cpu = 0; cpu < ncpu; cpu++)
-            total[key] += values[key][cpu];
-    }
-
-    close(fd);
 
     if (g_json_output) {
         printf("{\"pass\":%llu,\"drop_policy\":%llu,\"drop_suspicious\":%llu,\"drop_mitigated\":%llu,\"mitigation_set\":%llu,\"parse_error\":%llu,\"dns_amp\":%llu,\"ack_flood\":%llu,\"udp_random\":%llu,\"port_scan\":%llu,\"rst_flood\":%llu,\"syn_flood\":%llu,\"udp_amp\":%llu,\"icmp_flood\":%llu,\"tcp_weird\":%llu,\"event_drop\":%llu,\"monitor_only\":%llu,\"drop_emergency\":%llu}\n",
@@ -776,6 +865,71 @@ static int print_stats_once(void)
             (unsigned long long)total[STAT_EVENT_DROP],
             (unsigned long long)total[STAT_MONITOR_ONLY],
             (unsigned long long)total[STAT_DROP_EMERGENCY]);
+    }
+
+    return 0;
+}
+
+static int active_loop(int interval, int top_n)
+{
+    __u64 prev[STAT_MAX] = {};
+    __u64 curr[STAT_MAX] = {};
+    bool have_prev = false;
+
+    if (interval <= 0)
+        interval = 2;
+    if (top_n <= 0)
+        top_n = 10;
+    if (top_n > 64)
+        top_n = 64;
+
+    signal(SIGINT, on_sigint);
+    signal(SIGTERM, on_sigint);
+
+    while (keep_running) {
+        time_t now = time(NULL);
+        struct tm tm_now;
+        char ts[64];
+        int active_blocks;
+
+        if (collect_stats_totals(curr) < 0)
+            return -1;
+
+        localtime_r(&now, &tm_now);
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_now);
+        active_blocks = count_active_blocks();
+
+        printf("\n=== active %s ===\n", ts);
+        if (active_blocks >= 0)
+            printf("blocked_now=%d", active_blocks);
+        else
+            printf("blocked_now=unknown");
+
+        if (have_prev) {
+            printf("  +drop_mitigated=%llu +mitigation_set=%llu +dns_amp=%llu +udp_amp=%llu +monitor_only=%llu +drop_emergency=%llu\n",
+                (unsigned long long)(curr[STAT_DROP_MITIGATED] - prev[STAT_DROP_MITIGATED]),
+                (unsigned long long)(curr[STAT_MITIGATION_SET] - prev[STAT_MITIGATION_SET]),
+                (unsigned long long)(curr[STAT_DNS_AMP] - prev[STAT_DNS_AMP]),
+                (unsigned long long)(curr[STAT_UDP_AMP] - prev[STAT_UDP_AMP]),
+                (unsigned long long)(curr[STAT_MONITOR_ONLY] - prev[STAT_MONITOR_ONLY]),
+                (unsigned long long)(curr[STAT_DROP_EMERGENCY] - prev[STAT_DROP_EMERGENCY]));
+        } else {
+            printf("  collecting baseline...\n");
+        }
+
+        printf("totals: drop_mitigated=%llu mitigation_set=%llu dns_amp=%llu udp_amp=%llu monitor_only=%llu drop_emergency=%llu\n",
+            (unsigned long long)curr[STAT_DROP_MITIGATED],
+            (unsigned long long)curr[STAT_MITIGATION_SET],
+            (unsigned long long)curr[STAT_DNS_AMP],
+            (unsigned long long)curr[STAT_UDP_AMP],
+            (unsigned long long)curr[STAT_MONITOR_ONLY],
+            (unsigned long long)curr[STAT_DROP_EMERGENCY]);
+
+        print_top_states(top_n);
+
+        memcpy(prev, curr, sizeof(prev));
+        have_prev = true;
+        sleep(interval);
     }
 
     return 0;
@@ -1258,33 +1412,39 @@ static int do_load(const char *ifname, const char *rules_file)
         return -1;
     }
 
-    if (bpf_set_link_xdp_fd(ifindex, prog_fd, XDP_FLAGS_DRV_MODE) < 0) {
+    if (bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_DRV_MODE, NULL) < 0) {
         fprintf(stderr, "failed attaching XDP in driver mode to %s (interface may not support native mode)\n", ifname);
         bpf_object__close(obj);
         return -1;
     }
 
     if (ensure_pin_base() < 0) {
-        bpf_set_link_xdp_fd(ifindex, -1, XDP_FLAGS_DRV_MODE);
+        bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL);
+        bpf_object__close(obj);
+        return -1;
+    }
+
+    if (clear_pinned_objects() < 0) {
+        bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL);
         bpf_object__close(obj);
         return -1;
     }
 
     if (bpf_object__pin_maps(obj, PIN_BASE) < 0) {
         fprintf(stderr, "failed pinning maps to %s\n", PIN_BASE);
-        bpf_set_link_xdp_fd(ifindex, -1, XDP_FLAGS_DRV_MODE);
+        bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL);
         bpf_object__close(obj);
         return -1;
     }
 
     if (set_defaults(&cfg) < 0) {
-        bpf_set_link_xdp_fd(ifindex, -1, XDP_FLAGS_DRV_MODE);
+        bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL);
         bpf_object__close(obj);
         return -1;
     }
 
     if (rules_file && apply_rules_file(rules_file) < 0) {
-        bpf_set_link_xdp_fd(ifindex, -1, XDP_FLAGS_DRV_MODE);
+        bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL);
         bpf_object__close(obj);
         return -1;
     }
@@ -1292,6 +1452,155 @@ static int do_load(const char *ifname, const char *rules_file)
     printf("xdp_ddos loaded on %s in driver mode\n", ifname);
     bpf_object__close(obj);
     return 0;
+}
+
+static int do_unload_many(int if_count, char **ifaces)
+{
+    int i;
+    int failures = 0;
+
+    for (i = 0; i < if_count; i++) {
+        int ifindex = if_nametoindex(ifaces[i]);
+
+        if (!ifindex) {
+            fprintf(stderr, "invalid interface: %s\n", ifaces[i]);
+            failures++;
+            continue;
+        }
+
+        if (bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL) < 0) {
+            fprintf(stderr, "failed detaching XDP from %s\n", ifaces[i]);
+            failures++;
+            continue;
+        }
+
+        printf("xdp_ddos unloaded from %s\n", ifaces[i]);
+    }
+
+    return failures ? -1 : 0;
+}
+
+static int do_load_many(int if_count, char **ifaces, const char *rules_file)
+{
+    struct bpf_object *obj = NULL;
+    struct bpf_program *prog;
+    struct global_cfg cfg = {
+        .anomaly_mult_pct = XDP_DDOS_DEFAULT_ANOMALY_MULT_PCT,
+        .score_threshold = XDP_DDOS_DEFAULT_SCORE_THRESHOLD,
+        .block_ttl_sec = XDP_DDOS_DEFAULT_BLOCK_TTL_SEC,
+        .offense_threshold = XDP_DDOS_DEFAULT_OFFENSES,
+        .auto_mitigation = 1,
+        .warmup_windows = XDP_DDOS_DEFAULT_WARMUP_WINDOWS,
+        .ewma_shift = 3,
+        .ack_only_ratio_pct = XDP_DDOS_DEFAULT_ACK_ONLY_RATIO_PCT,
+        .rst_ratio_pct = XDP_DDOS_DEFAULT_RST_RATIO_PCT,
+        .syn_ratio_pct = XDP_DDOS_DEFAULT_SYN_RATIO_PCT,
+        .dns_resp_ratio_pct = XDP_DDOS_DEFAULT_DNS_RESP_RATIO_PCT,
+        .dns_amp_min_bytes = XDP_DDOS_DEFAULT_DNS_AMP_MIN_BYTES,
+        .udp_random_spread_bins = XDP_DDOS_DEFAULT_UDP_RANDOM_SPREAD,
+        .scan_spread_bins = XDP_DDOS_DEFAULT_SCAN_SPREAD,
+        .udp_amp_ratio_pct = XDP_DDOS_DEFAULT_UDP_AMP_RATIO_PCT,
+        .icmp_ratio_pct = XDP_DDOS_DEFAULT_ICMP_RATIO_PCT,
+        .block_min_score = XDP_DDOS_DEFAULT_BLOCK_MIN_SCORE,
+        .block_min_reasons = XDP_DDOS_DEFAULT_BLOCK_MIN_REASONS,
+        .emergency_cooldown_sec = XDP_DDOS_DEFAULT_EMERGENCY_COOLDOWN_SEC,
+        .service_relax_dns_pct = XDP_DDOS_DEFAULT_SERVICE_RELAX_DNS_PCT,
+        .service_relax_http_pct = XDP_DDOS_DEFAULT_SERVICE_RELAX_HTTP_PCT,
+        .service_relax_https_pct = XDP_DDOS_DEFAULT_SERVICE_RELAX_HTTPS_PCT,
+        .service_relax_ntp_pct = XDP_DDOS_DEFAULT_SERVICE_RELAX_NTP_PCT,
+    };
+    int ifidx[64];
+    int attached = 0;
+    int i;
+    int prog_fd;
+
+    if (if_count <= 0 || if_count > 64) {
+        fprintf(stderr, "invalid interface count: %d\n", if_count);
+        return -1;
+    }
+
+    for (i = 0; i < if_count; i++) {
+        ifidx[i] = if_nametoindex(ifaces[i]);
+        if (!ifidx[i]) {
+            fprintf(stderr, "invalid interface: %s\n", ifaces[i]);
+            return -1;
+        }
+    }
+
+    obj = bpf_object__open_file(OBJ_FILE, NULL);
+    if (libbpf_get_error(obj)) {
+        fprintf(stderr, "failed opening %s\n", OBJ_FILE);
+        return -1;
+    }
+
+    if (bpf_object__load(obj) < 0) {
+        fprintf(stderr, "failed loading BPF object\n");
+        bpf_object__close(obj);
+        return -1;
+    }
+
+    prog = bpf_object__find_program_by_name(obj, "xdp_ddos_filter");
+    if (!prog)
+        prog = bpf_object__next_program(obj, NULL);
+    if (!prog) {
+        fprintf(stderr, "failed finding XDP program\n");
+        bpf_object__close(obj);
+        return -1;
+    }
+
+    prog_fd = bpf_program__fd(prog);
+    if (prog_fd < 0) {
+        fprintf(stderr, "failed getting program fd\n");
+        bpf_object__close(obj);
+        return -1;
+    }
+
+    for (i = 0; i < if_count; i++) {
+        if (bpf_xdp_attach(ifidx[i], prog_fd, XDP_FLAGS_DRV_MODE, NULL) < 0) {
+            fprintf(stderr, "failed attaching XDP in driver mode to %s\n", ifaces[i]);
+            goto fail;
+        }
+        attached++;
+    }
+
+    if (ensure_pin_base() < 0)
+        goto fail;
+
+    if (clear_pinned_objects() < 0)
+        goto fail;
+
+    if (bpf_object__pin_maps(obj, PIN_BASE) < 0) {
+        fprintf(stderr, "failed pinning maps to %s\n", PIN_BASE);
+        goto fail;
+    }
+
+    if (set_defaults(&cfg) < 0)
+        goto fail;
+
+    if (rules_file && apply_rules_file(rules_file) < 0)
+        goto fail;
+
+    printf("xdp_ddos loaded in shared mode on");
+    for (i = 0; i < if_count; i++)
+        printf(" %s", ifaces[i]);
+    printf("\n");
+
+    bpf_object__close(obj);
+    return 0;
+
+fail:
+    while (attached > 0) {
+        attached--;
+        bpf_xdp_detach(ifidx[attached], XDP_FLAGS_DRV_MODE, NULL);
+    }
+    bpf_object__close(obj);
+    return -1;
+}
+
+static int do_reload_many(int if_count, char **ifaces, const char *rules_file)
+{
+    do_unload_many(if_count, ifaces);
+    return do_load_many(if_count, ifaces, rules_file);
 }
 
 static int do_unload(const char *ifname)
@@ -1303,7 +1612,7 @@ static int do_unload(const char *ifname)
         return -1;
     }
 
-    if (bpf_set_link_xdp_fd(ifindex, -1, XDP_FLAGS_DRV_MODE) < 0) {
+    if (bpf_xdp_detach(ifindex, XDP_FLAGS_DRV_MODE, NULL) < 0) {
         fprintf(stderr, "failed detaching XDP from %s\n", ifname);
         return -1;
     }
@@ -1317,7 +1626,7 @@ int main(int argc, char **argv)
     const char *cmd;
 
     libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
-    libbpf_set_print(NULL);
+    libbpf_set_print(libbpf_logger);
 
     if (bump_memlock())
         fprintf(stderr, "warning: unable to raise memlock limit\n");
@@ -1343,12 +1652,36 @@ int main(int argc, char **argv)
         return do_load(argv[2], argc == 4 ? argv[3] : NULL) ? 1 : 0;
     }
 
+    if (!strcmp(cmd, "load-many")) {
+        if (argc < 5) {
+            usage(argv[0]);
+            return 1;
+        }
+        return do_load_many(argc - 3, &argv[3], strcmp(argv[2], "-") ? argv[2] : NULL) ? 1 : 0;
+    }
+
     if (!strcmp(cmd, "unload")) {
         if (argc != 3) {
             usage(argv[0]);
             return 1;
         }
         return do_unload(argv[2]) ? 1 : 0;
+    }
+
+    if (!strcmp(cmd, "unload-many")) {
+        if (argc < 3) {
+            usage(argv[0]);
+            return 1;
+        }
+        return do_unload_many(argc - 2, &argv[2]) ? 1 : 0;
+    }
+
+    if (!strcmp(cmd, "reload-many")) {
+        if (argc < 5) {
+            usage(argv[0]);
+            return 1;
+        }
+        return do_reload_many(argc - 3, &argv[3], strcmp(argv[2], "-") ? argv[2] : NULL) ? 1 : 0;
     }
 
     if (!strcmp(cmd, "stats"))
@@ -1359,6 +1692,16 @@ int main(int argc, char **argv)
         if (argc > 2)
             interval = atoi(argv[2]);
         return monitor_loop(interval) ? 1 : 0;
+    }
+
+    if (!strcmp(cmd, "active")) {
+        int interval = 2;
+        int top_n = 10;
+        if (argc > 2)
+            interval = atoi(argv[2]);
+        if (argc > 3)
+            top_n = atoi(argv[3]);
+        return active_loop(interval, top_n) ? 1 : 0;
     }
 
     if (!strcmp(cmd, "log")) {

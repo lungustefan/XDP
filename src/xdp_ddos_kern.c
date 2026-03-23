@@ -5,8 +5,6 @@
 #include <linux/ipv6.h>
 #include <linux/ip.h>
 #include <linux/in.h>
-#include <linux/icmp.h>
-#include <linux/icmpv6.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
@@ -87,44 +85,24 @@ static __always_inline __u32 max_u32(__u32 a, __u32 b)
     return a > b ? a : b;
 }
 
-static __always_inline __u32 ewma_q8(__u32 prev_q8, __u32 sample, __u32 shift)
+static __always_inline __u32 ewma_q8(__u32 prev_q8, __u32 sample)
 {
     __u32 sample_q8 = sample << 8;
 
     if (!prev_q8)
         return sample_q8;
-    if (!shift || shift > 8)
-        shift = 3;
 
-    return prev_q8 - (prev_q8 >> shift) + (sample_q8 >> shift);
-}
-
-static __always_inline __u32 bit_count64(__u64 v)
-{
-    __u32 count = 0;
-    int i;
-
-#pragma clang loop unroll(full)
-    for (i = 0; i < 64; i++) {
-        if (v & ((__u64)1 << i))
-            count++;
-    }
-
-    return count;
+    return prev_q8 - (prev_q8 >> 3) + (sample_q8 >> 3);
 }
 
 static __always_inline __u32 bit_count32(__u32 v)
 {
-    __u32 count = 0;
-    int i;
-
-#pragma clang loop unroll(full)
-    for (i = 0; i < 32; i++) {
-        if (v & ((__u32)1 << i))
-            count++;
-    }
-
-    return count;
+    v = v - ((v >> 1) & 0x55555555U);
+    v = (v & 0x33333333U) + ((v >> 2) & 0x33333333U);
+    v = (v + (v >> 4)) & 0x0F0F0F0FU;
+    v = v + (v >> 8);
+    v = v + (v >> 16);
+    return v & 0x3FU;
 }
 
 static __always_inline __u32 resolve_anomaly_mult(const struct global_cfg *cfg,
@@ -184,17 +162,12 @@ static __always_inline void emit_event(const struct ip_key *key,
     bpf_ringbuf_submit(evt, 0);
 }
 
-static __always_inline void update_baselines(struct ip_state *state,
-                         const struct global_cfg *cfg)
+static __always_inline void update_baselines(struct ip_state *state)
 {
-    state->baseline_pps_q8 = ewma_q8(state->baseline_pps_q8, state->pkt_count,
-                     cfg->ewma_shift);
-    state->baseline_bps_q8 = ewma_q8(state->baseline_bps_q8, state->byte_count,
-                     cfg->ewma_shift);
-    state->baseline_syn_q8 = ewma_q8(state->baseline_syn_q8, state->syn_count,
-                     cfg->ewma_shift);
-    state->baseline_ack_q8 = ewma_q8(state->baseline_ack_q8, state->ack_only_count,
-                     cfg->ewma_shift);
+    state->baseline_pps_q8 = ewma_q8(state->baseline_pps_q8, state->pkt_count);
+    state->baseline_bps_q8 = ewma_q8(state->baseline_bps_q8, state->byte_count);
+    state->baseline_syn_q8 = ewma_q8(state->baseline_syn_q8, state->syn_count);
+    state->baseline_ack_q8 = ewma_q8(state->baseline_ack_q8, state->ack_only_count);
 }
 
 static __always_inline void reset_window_state(struct ip_state *state, __u64 now)
@@ -251,10 +224,8 @@ static __always_inline int eval_completed_window(struct ip_state *state,
     __u32 ack_ratio = 0;
     __u32 rst_ratio = 0;
     __u32 syn_ratio = 0;
-    __u32 icmp_ratio = 0;
-    __u32 dns_ratio = 0;
     __u32 udp_amp_ratio = 0;
-    __u32 udp_high_ratio = 0;
+    __u32 dns_resp_ratio = 0;
     __u32 reason_count;
     __u32 block_min_score = cfg->block_min_score;
     __u32 block_min_reasons = cfg->block_min_reasons;
@@ -278,7 +249,7 @@ static __always_inline int eval_completed_window(struct ip_state *state,
         block_min_reasons = XDP_DDOS_DEFAULT_BLOCK_MIN_REASONS;
 
     if (state->warmup_seen < cfg->warmup_windows) {
-        update_baselines(state, cfg);
+        update_baselines(state);
         state->warmup_seen++;
         return 0;
     }
@@ -323,9 +294,6 @@ static __always_inline int eval_completed_window(struct ip_state *state,
     if (state->pkt_count > 25)
         syn_ratio = (state->syn_count * 100) / state->pkt_count;
 
-    if (state->pkt_count > 25)
-        icmp_ratio = (state->icmp_count * 100) / state->pkt_count;
-
     if (state->ack_only_count > 20 && ack_ratio >= cfg->ack_only_ratio_pct &&
         state->syn_count < (state->pkt_count / 20 + 1)) {
         score += 65;
@@ -345,29 +313,25 @@ static __always_inline int eval_completed_window(struct ip_state *state,
         stat_inc(STAT_SYN_FLOOD);
     }
 
-    if (state->icmp_count > 20 && icmp_ratio >= cfg->icmp_ratio_pct) {
-        score += 55;
-        reason_mask |= XDP_DDOS_REASON_ICMP_FLOOD;
-        stat_inc(STAT_ICMP_FLOOD);
-    }
-
-    if (state->tcp_weird_count > 6) {
-        score += 50;
-        reason_mask |= XDP_DDOS_REASON_TCP_WEIRD;
-        stat_inc(STAT_TCP_WEIRD);
-    }
-
     if (state->udp_count > 20) {
-        dns_ratio = (state->dns_resp_like_count * 100) / state->udp_count;
         udp_amp_ratio = (state->udp_amp_like_count * 100) / state->udp_count;
-        udp_high_ratio = (state->udp_high_port_count * 100) / state->udp_count;
+        dns_resp_ratio = (state->dns_resp_like_count * 100) / state->udp_count;
     }
 
-    if (state->dns_resp_like_count > 8 && dns_ratio >= cfg->dns_resp_ratio_pct) {
-        score += 70;
+    if (state->dns_resp_like_count > 10 &&
+        dns_resp_ratio >= cfg->dns_resp_ratio_pct) {
+        score += 85;
         reason_mask |= XDP_DDOS_REASON_DNS_AMP;
         stat_inc(STAT_DNS_AMP);
     }
+
+    if (state->udp_count > 1200 &&
+        state->dns_resp_like_count > 300) {
+        score += 120;
+        reason_mask |= XDP_DDOS_REASON_DNS_AMP;
+        stat_inc(STAT_DNS_AMP);
+    }
+
 
     if (state->udp_amp_like_count > 10 &&
         udp_amp_ratio >= cfg->udp_amp_ratio_pct) {
@@ -376,23 +340,20 @@ static __always_inline int eval_completed_window(struct ip_state *state,
         stat_inc(STAT_UDP_AMP);
     }
 
-    if (state->udp_count > 32 &&
-        state->dst_port_spread >= cfg->udp_random_spread_bins &&
-        udp_high_ratio >= 70) {
-        score += 60;
-        reason_mask |= XDP_DDOS_REASON_UDP_RANDOM;
-        stat_inc(STAT_UDP_RANDOM);
+    if (state->udp_count > 1400 &&
+        state->udp_amp_like_count > 350) {
+        score += 110;
+        reason_mask |= XDP_DDOS_REASON_UDP_AMP;
+        stat_inc(STAT_UDP_AMP);
     }
 
-    if (state->pkt_count > 28 &&
-        state->dst_port_spread >= cfg->scan_spread_bins &&
-        state->syn_count > 4) {
-        score += 70;
-        reason_mask |= XDP_DDOS_REASON_PORT_SCAN;
-        stat_inc(STAT_PORT_SCAN);
+    if (state->icmp_count > 1200) {
+        score += 110;
+        reason_mask |= XDP_DDOS_REASON_ICMP_FLOOD;
+        stat_inc(STAT_ICMP_FLOOD);
     }
 
-    update_baselines(state, cfg);
+    update_baselines(state);
 
     if (reason_mask)
         state->last_reason_mask = reason_mask;
@@ -440,8 +401,8 @@ static __always_inline int emergency_guard(struct ip_state *state,
     __u32 anomaly_mult = resolve_anomaly_mult(cfg, policy);
     __u32 baseline_pps = state->baseline_pps_q8 >> 8;
     __u32 baseline_bps = state->baseline_bps_q8 >> 8;
-    __u32 pps_floor = 200000;
-    __u32 bps_floor = 300000000;
+    __u32 pps_floor = 15000;
+    __u32 bps_floor = 30000000;
     __u32 guard_pps = max_u32(max_u32(baseline_pps, 2000) * (anomaly_mult / 100 + 9),
                   pps_floor);
     __u32 guard_bps = max_u32(max_u32(baseline_bps, 4000000) * (anomaly_mult / 100 + 9),
@@ -466,6 +427,20 @@ static __always_inline int emergency_guard(struct ip_state *state,
 
     if (state->udp_count > 25000 && state->udp_amp_like_count > (state->udp_count * 70) / 100)
         reason_mask |= XDP_DDOS_REASON_UDP_AMP;
+
+    if (state->udp_count > 4500 && state->udp_amp_like_count > (state->udp_count * 45) / 100)
+        reason_mask |= XDP_DDOS_REASON_UDP_AMP;
+
+    if (state->udp_count > 12000 &&
+        state->dns_resp_like_count > (state->udp_count * 55) / 100)
+        reason_mask |= XDP_DDOS_REASON_DNS_AMP;
+
+    if (state->udp_count > 3500 &&
+        state->dns_resp_like_count > (state->udp_count * 30) / 100)
+        reason_mask |= XDP_DDOS_REASON_DNS_AMP;
+
+    if (state->icmp_count > 3500)
+        reason_mask |= XDP_DDOS_REASON_ICMP_FLOOD;
 
     if (!reason_mask)
         return 0;
@@ -677,8 +652,6 @@ int xdp_ddos_filter(struct xdp_md *ctx)
     __u8 is_rst = 0;
     __u8 is_ack_only = 0;
     __u8 is_weird = 0;
-    __u32 spread_bin;
-    __u64 spread_mask;
     __u32 action = DDOS_ACTION_ADAPTIVE;
     __u8 l4_parsable = 1;
 
@@ -777,35 +750,19 @@ int xdp_ddos_filter(struct xdp_md *ctx)
                 state->rst_count++;
             if (is_ack_only)
                 state->ack_only_count++;
-            if (is_weird)
-                state->tcp_weird_count++;
 
-            spread_bin = dport & 63;
-            spread_mask = (__u64)1 << spread_bin;
-            if (!(state->dst_port_bits & spread_mask)) {
-                state->dst_port_bits |= spread_mask;
-                state->dst_port_spread = bit_count64(state->dst_port_bits);
-            }
+            (void)is_weird;
         }
     } else if (ip_proto == IPPROTO_UDP && l4_parsable) {
         if (parse_udp(l4, data_end, &sport, &dport, &udp_len) == 0) {
             state->last_dport = dport;
             state->udp_count++;
-            if (dport >= 1024)
-                state->udp_high_port_count++;
 
-            if (sport == 53 && pkt_len >= cfg->dns_amp_min_bytes && udp_len >= 300)
+            if (sport == 53 && udp_len >= cfg->dns_amp_min_bytes)
                 state->dns_resp_like_count++;
 
             if (is_udp_amp_source_port(sport) && udp_len >= 180)
                 state->udp_amp_like_count++;
-
-            spread_bin = dport & 63;
-            spread_mask = (__u64)1 << spread_bin;
-            if (!(state->dst_port_bits & spread_mask)) {
-                state->dst_port_bits |= spread_mask;
-                state->dst_port_spread = bit_count64(state->dst_port_bits);
-            }
         }
     } else if (ip_proto == IPPROTO_ICMP || ip_proto == IPPROTO_ICMPV6) {
         state->icmp_count++;
