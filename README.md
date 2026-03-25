@@ -1,3 +1,7 @@
+---
+THIS IS NOT PRODUCTION READY
+---
+
 # XDP DDoS Filter (Driver Mode, Adaptive)
 
 This project provides an XDP/eBPF DDoS protection filter with:
